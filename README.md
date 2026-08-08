@@ -2,7 +2,7 @@
 
 [![Playwright Tests](https://github.com/InfoAdam1998/pw-Restful-Booker-test/actions/workflows/playwright.yml/badge.svg)](https://github.com/InfoAdam1998/pw-Restful-Booker-test/actions/workflows/playwright.yml)
 
-API test automation for the [Restful-Booker](https://restful-booker.herokuapp.com/) API, built with **Playwright** and **TypeScript**. The suite covers the full CRUD lifecycle of a booking (create, read, update, delete), token-based authentication, and negative/error-path testing — organised with an API client class, custom fixtures, and a test-data builder, and run automatically in CI via GitHub Actions.
+API test automation for the [Restful-Booker](https://restful-booker.herokuapp.com/) API, built with **Playwright** and **TypeScript**, plus a **k6** performance-testing suite. The functional suite covers the full CRUD lifecycle of a booking (create, read, update, delete), token-based authentication, and negative/error-path testing — organised with an API client class, custom fixtures, and a test-data builder, and run automatically in CI via GitHub Actions. The k6 suite load-tests the same API to measure how it behaves under concurrent traffic.
 
 ---
 
@@ -16,6 +16,7 @@ API test automation for the [Restful-Booker](https://restful-booker.herokuapp.co
 - **Test-data builder** — a `makeBooking()` factory generates valid payloads with per-test overrides, keeping tests concise and readable.
 - **Test independence** — every test creates its own data (the API resets every 10 minutes and is shared), so no test depends on pre-existing records.
 - **Negative & bug-hunting tests** — invalid IDs, missing authentication, and malformed payloads, including a **real defect documented with `test.fail()`** (see below).
+- **Performance / load testing with k6** — smoke, load, and CRUD-journey scenarios with quality-gate thresholds, per-endpoint tagging, and authentication under load.
 - **Secrets management** — credentials are read from environment variables (a git-ignored `.env` locally, GitHub Secrets in CI); no credentials are committed.
 - **Continuous Integration** — every push and pull request runs the full suite on GitHub Actions.
 
@@ -25,6 +26,7 @@ API test automation for the [Restful-Booker](https://restful-booker.herokuapp.co
 
 - [Playwright Test](https://playwright.dev/) (`@playwright/test`) — using its API testing capabilities (`request` fixture)
 - TypeScript
+- [k6](https://k6.io) for performance / load testing
 - [dotenv](https://www.npmjs.com/package/dotenv) for local environment variables
 - GitHub Actions for CI
 
@@ -49,6 +51,17 @@ pw-Restful-Booker-test/
 │   ├── read-bookings.spec.ts     # GET /ping, /booking, /booking/:id, filtering
 │   ├── update-delete-booking.spec.ts  # PUT, PATCH, DELETE
 │   └── negative.spec.ts          # unauthorised, not-found, malformed input
+├── performance/                  # k6 performance-testing suite (see below)
+│   ├── config/
+│   │   ├── thresholds.js         # shared pass/fail quality gates
+│   │   └── scenarios.js          # reusable load profiles (smoke/load/stress/spike)
+│   └── tests/
+│       ├── smoke.test.js
+│       ├── load.test.js
+│       ├── reads-tagged.load.test.js
+│       ├── create-booking.load.test.js
+│       ├── update-booking.load.test.js
+│       └── booking-journey.load.test.js
 ├── playwright.config.ts          # baseURL, single project, dotenv
 ├── .env                          # local credentials (git-ignored, not committed)
 ├── package.json
@@ -92,6 +105,7 @@ When a booking is created without a required field (e.g. `firstname`), a well-be
 
 - [Node.js](https://nodejs.org/) (LTS)
 - npm
+- [k6](https://k6.io) (for the performance suite) — install via `winget install k6`, `choco install k6`, or from the [k6 releases page](https://github.com/grafana/k6/releases)
 
 ### Installation
 
@@ -143,6 +157,61 @@ Required secrets:
 
 - `ADMIN_USER`
 - `ADMIN_PASSWORD`
+
+---
+
+## Performance Testing (k6)
+
+In addition to the functional suite, the API is load-tested with [k6](https://k6.io) to measure how it behaves under concurrent traffic — a dimension functional tests don't cover.
+
+### Structure
+
+```
+performance/
+├── config/
+│   ├── thresholds.js     # shared pass/fail quality gates (p95 latency, error rate)
+│   └── scenarios.js      # reusable load profiles (smoke, load, stress, spike)
+└── tests/
+    ├── smoke.test.js               # 1-VU sanity check (GET /booking)
+    ├── load.test.js                # ramping load to 20 VUs (GET /booking)
+    ├── reads-tagged.load.test.js   # per-endpoint tagged thresholds (list vs single)
+    ├── create-booking.load.test.js # write load (POST /booking)
+    ├── update-booking.load.test.js # authenticated write load (PUT + setup() token)
+    └── booking-journey.load.test.js# full CRUD journey (create -> read -> update -> delete)
+```
+
+### Concepts demonstrated
+
+- **Load profiles** — smoke, load, stress, and spike scenarios, centralized in `config/scenarios.js` so tests import a profile rather than redefining stages.
+- **Thresholds as quality gates** — p95 latency and error-rate limits in `config/thresholds.js`; k6 exits non-zero if breached, making it CI-ready.
+- **Checks** — per-request validation of status and body under load.
+- **`setup()` lifecycle** — authenticating once and sharing the token across all virtual users, rather than re-authenticating on every request.
+- **Per-endpoint tags & differentiated thresholds** — the heavier list endpoint and the lighter single-booking endpoint are tagged and held to separate gates (`p(95)<900` vs `p(95)<700`).
+- **A realistic CRUD journey** — one virtual user performs create -> read -> update -> delete in sequence, grouped for per-step reporting, with each VU owning its own data to avoid collisions under concurrency.
+
+### Key findings
+
+- **Reads degrade under load.** `GET /booking` p95 rose from ~310ms (1 user) to ~735ms (20 users) — roughly doubling — while staying within error-rate limits.
+- **Endpoint size matters.** The list endpoint (all bookings) is consistently slower than a single booking (p95 ~735ms vs ~450ms under load), which is why the two are held to different thresholds.
+- **Writes are strong but variable.** The authenticated update endpoint was the best performer (p95 ~186ms, zero failures at 20 VUs); the create endpoint occasionally showed tail-latency spikes, and the shared public demo intermittently rate-limits writes with HTTP 418.
+
+### Running the performance tests
+
+```bash
+# smoke test (quick sanity check, 1 user)
+k6 run performance/tests/smoke.test.js
+
+# a load test (ramps to 20 concurrent users)
+k6 run performance/tests/load.test.js
+
+# override the profile for a quick custom run
+k6 run --vus 5 --duration 30s performance/tests/load.test.js
+
+# run with the live web dashboard (real-time graphs in the browser)
+k6 run --out web-dashboard performance/tests/load.test.js
+```
+
+> [k6](https://k6.io) is a standalone binary with no Node dependency. Tests run against the shared public Restful-Booker instance, which resets periodically and intermittently rate-limits writes — occasional throttling under load is environmental, not a test defect.
 
 ---
 
