@@ -28,3 +28,12 @@ jobs:
         name: playwright-report
         path: playwright-report/
         retention-days: 30
+
+  performance:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run k6 smoke test (performance gate)
+      uses: grafana/k6-action@v0.3.1
+      with:
+        filename: performance/tests/smoke.test.js
